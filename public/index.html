@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3SCooltrans | Theo dõi giờ cấm xe</title>
+<style>
+:root{font-family:Arial,Helvetica,sans-serif;color:#1f2937;background:#f3f6f4}*{box-sizing:border-box}body{margin:0}header{background:#126b43;color:white;padding:22px max(18px,calc((100% - 1180px)/2))}header h1{margin:0 0 6px;font-size:24px}header p{margin:0;opacity:.9}main{max-width:1180px;margin:24px auto;padding:0 16px}.panel{background:#fff;border-radius:14px;padding:20px;box-shadow:0 3px 14px #1232;margin-bottom:18px}h2{font-size:18px;margin:0 0 16px}label{display:block;font-size:13px;font-weight:700;margin:0 0 6px}input,select{width:100%;padding:11px 12px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px;background:white}button{border:0;border-radius:8px;padding:11px 15px;background:#14784c;color:white;font-weight:700;cursor:pointer}button:hover{filter:brightness(.94)}button.secondary{background:#e5e7eb;color:#111827}button.danger{background:#b91c1c}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.password-wrap{display:flex;gap:8px}.password-wrap input{flex:1;min-width:0}.password-wrap button{white-space:nowrap}.login{max-width:430px;margin:8vh auto}.hidden{display:none!important}.muted{color:#64748b;font-size:13px}.message{margin-top:12px;color:#b91c1c;font-size:14px}.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-bottom:12px}.toolbar input{max-width:320px}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:11px 9px;text-align:left;border-bottom:1px solid #e5e7eb}th{background:#f8fafc}.status{display:inline-block;padding:5px 9px;border-radius:999px;font-weight:700;font-size:12px}.green{background:#dcfce7;color:#166534}.yellow{background:#fef3c7;color:#92400e}.red{background:#fee2e2;color:#991b1b}.gray{background:#e5e7eb;color:#374151}.actions{display:flex;gap:6px;flex-wrap:wrap}.actions button{padding:7px 9px;font-size:12px}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:18px}.stat{padding:14px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0}.stat strong{font-size:24px;display:block;margin-top:6px}.table-wrap{overflow-x:auto}.alert{padding:12px 14px;border-radius:8px;margin:0 0 12px;background:#fff7ed;color:#9a3412}.empty{text-align:center;color:#64748b;padding:22px}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px}.user-form{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;align-items:end}@media(max-width:800px){.grid,.two-col{grid-template-columns:1fr 1fr}.user-form{grid-template-columns:1fr 1fr}.cards{grid-template-columns:1fr}}@media(max-width:520px){.grid,.two-col,.user-form{grid-template-columns:1fr}.cards{grid-template-columns:1fr}.login{margin:5vh auto}}
+</style>
+</head>
+<body>
+<header><h1>3SCooltrans</h1><p>Hệ thống theo dõi thời hạn giờ cấm xe</p></header>
+<main>
+<section id="loginPanel" class="panel login">
+<h2>Đăng nhập hệ thống</h2>
+<form id="loginForm">
+<div style="margin-bottom:14px"><label for="username">Tài khoản</label><input id="username" autocomplete="username" required placeholder="Nhập tài khoản"></div>
+<div><label for="password">Mật khẩu</label><div class="password-wrap"><input id="password" type="password" autocomplete="current-password" required placeholder="Nhập mật khẩu"><button type="button" id="togglePassword" class="secondary">Hiện</button></div></div>
+<button style="width:100%;margin-top:16px" type="submit">Đăng nhập</button><div id="loginMessage" class="message" role="alert"></div>
+</form><p class="muted">Đăng nhập được xác thực ở máy chủ. Mật khẩu không được gửi lại hoặc hiển thị trong trang.</p>
+</section>
+<section id="appPanel" class="hidden">
+<div id="alertArea"></div>
+<div class="panel">
+<div class="toolbar"><h2 id="formTitle">Thêm thời hạn giờ cấm</h2><div><span id="userInfo" class="muted"></span> <button id="logoutBtn" class="secondary">Đăng xuất</button></div></div>
+<form id="vehicleForm">
+<input type="hidden" id="vehicleId">
+<div class="grid">
+<div><label for="vehicleName">Biển số xe / Tên xe *</label><input id="vehicleName" maxlength="100" required placeholder="Ví dụ: 51D-123.45"></div>
+<div><label for="startDate">Ngày bắt đầu *</label><input id="startDate" type="date" required></div>
+<div><label for="endDate">Ngày kết thúc *</label><input id="endDate" type="date" required></div>
+<div><label for="notes">Ghi chú</label><input id="notes" maxlength="1000" placeholder="Tuyến đường, ghi chú..."></div>
+</div><div style="display:flex;gap:8px;margin-top:14px"><button type="submit" id="saveVehicleBtn">Lưu xe</button><button type="button" id="cancelEditBtn" class="secondary hidden">Hủy sửa</button></div>
+</form>
+<p class="muted">Đỏ: đã hết hạn · Vàng: còn 0–10 ngày · Xanh: còn trên 20 ngày · Xám: còn 11–20 ngày.</p>
+</div>
+<div class="cards"><div class="stat">Tổng xe<strong id="totalCount">0</strong></div><div class="stat">Sắp hết hạn (10 ngày trở xuống)<strong id="yellowCount">0</strong></div><div class="stat">Đã hết hạn<strong id="redCount">0</strong></div></div>
+<div class="panel">
+<div class="toolbar"><h2>Danh sách theo dõi</h2><input id="search" placeholder="Tìm theo biển số xe..."></div>
+<div class="table-wrap"><table><thead><tr><th>Biển số / Tên xe</th><th>Ngày bắt đầu</th><th>Ngày kết thúc</th><th>Còn lại</th><th>Trạng thái</th><th>Ghi chú</th><th>Thao tác</th></tr></thead><tbody id="vehicleRows"></tbody></table></div>
+<div style="margin-top:14px"><button id="exportBtn" class="secondary">Xuất CSV</button></div>
+</div>
+<section id="adminPanel" class="panel hidden">
+<h2>Quản lý tài khoản nhân viên</h2>
+<form id="userForm" class="user-form">
+<div><label for="newUsername">Tên đăng nhập</label><input id="newUsername" required minlength="3" maxlength="40" placeholder="vd: nhanvien01"></div>
+<div><label for="newPassword">Mật khẩu tạm (tối thiểu 12 ký tự)</label><input id="newPassword" type="password" required minlength="12" autocomplete="new-password"></div>
+<div><label for="newRole">Vai trò</label><select id="newRole"><option value="staff">Nhân viên</option><option value="admin">Quản trị viên</option></select></div>
+<button type="submit">Tạo tài khoản</button>
+</form><div id="userMessage" class="muted" style="margin:10px 0"></div>
+<div class="table-wrap"><table><thead><tr><th>Tài khoản</th><th>Vai trò</th><th>Ngày tạo</th><th></th></tr></thead><tbody id="userRows"></tbody></table></div>
+</section>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let currentUser=null, vehicles=[], editingId=null;
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(url,options={}) {
+  const res=await fetch(url,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error||'Có lỗi xảy ra.');
+  return data;
+}
+function showLogin(){ $('appPanel').classList.add('hidden'); $('loginPanel').classList.remove('hidden'); }
+function showApp(){ $('loginPanel').classList.add('hidden'); $('appPanel').classList.remove('hidden'); $('userInfo').textContent=`Đăng nhập: ${currentUser.username} (${currentUser.role==='admin'?'Quản trị':'Nhân viên'})`; $('adminPanel').classList.toggle('hidden',currentUser.role!=='admin'); }
+$('togglePassword').onclick=()=>{const inp=$('password'),show=inp.type==='password';inp.type=show?'text':'password';$('togglePassword').textContent=show?'Ẩn':'Hiện';};
+$('loginForm').onsubmit=async e=>{e.preventDefault();$('loginMessage').textContent='';try{const d=await api('/api/login',{method:'POST',body:JSON.stringify({username:$('username').value.trim(),password:$('password').value})});currentUser=d.user;showApp();await refreshAll();}catch(err){$('loginMessage').textContent=err.message;}};
+$('logoutBtn').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});}catch{}currentUser=null;$('loginForm').reset();showLogin();};
+$('vehicleForm').onsubmit=async e=>{e.preventDefault();const payload={vehicle_name:$('vehicleName').value.trim(),start_date:$('startDate').value,end_date:$('endDate').value,notes:$('notes').value.trim()};try{if(editingId)await api('/api/vehicles/'+editingId,{method:'PUT',body:JSON.stringify(payload)});else await api('/api/vehicles',{method:'POST',body:JSON.stringify(payload)});resetVehicleForm();await loadVehicles();}catch(err){alert(err.message);}};
+$('cancelEditBtn').onclick=resetVehicleForm;
+function resetVehicleForm(){editingId=null;$('vehicleForm').reset();$('vehicleId').value='';$('formTitle').textContent='Thêm thời hạn giờ cấm';$('saveVehicleBtn').textContent='Lưu xe';$('cancelEditBtn').classList.add('hidden');}
+function daysRemaining(end){const [y,m,d]=end.split('-').map(Number);const target=new Date(y,m-1,d);const now=new Date();now.setHours(0,0,0,0);return Math.round((target-now)/86400000);}
+function statusFor(n){if(n<0)return {label:'Đã hết hạn',cls:'red'};if(n<=10)return {label:n===0?'Hết hạn hôm nay':'Sắp hết hạn',cls:'yellow'};if(n>20)return {label:'Còn hiệu lực',cls:'green'};return {label:'Còn 11–20 ngày',cls:'gray'};}
+function fmtDate(s){if(!s)return '';const [y,m,d]=s.split('-');return `${d}/${m}/${y}`;}
+async function loadVehicles(){const d=await api('/api/vehicles');vehicles=d.vehicles;renderVehicles();}
+function renderVehicles(){const q=$('search').value.trim().toLowerCase();const list=vehicles.filter(v=>(v.vehicle_name+' '+v.notes).toLowerCase().includes(q));$('vehicleRows').innerHTML=list.length?list.map(v=>{const n=daysRemaining(v.end_date),st=statusFor(n),remaining=n<0?`Quá hạn ${Math.abs(n)} ngày`:n===0?'Hết hạn hôm nay':`${n} ngày`;return `<tr><td><strong>${esc(v.vehicle_name)}</strong></td><td>${fmtDate(v.start_date)}</td><td>${fmtDate(v.end_date)}</td><td>${remaining}</td><td><span class="status ${st.cls}">${st.label}</span></td><td>${esc(v.notes)}</td><td><div class="actions"><button class="secondary" data-edit="${v.id}">Sửa</button><button class="danger" data-delete="${v.id}">Xóa</button></div></td></tr>`;}).join(''):'<tr><td colspan="7" class="empty">Chưa có dữ liệu phù hợp.</td></tr>';
+$('totalCount').textContent=vehicles.length;$('yellowCount').textContent=vehicles.filter(v=>{const n=daysRemaining(v.end_date);return n>=0&&n<=10;}).length;$('redCount').textContent=vehicles.filter(v=>daysRemaining(v.end_date)<0).length;
+const alerts=vehicles.map(v=>({...v,n:daysRemaining(v.end_date)})).filter(v=>v.n<=10).sort((a,b)=>a.n-b.n);
+$('alertArea').innerHTML=alerts.length?`<div class="alert"><strong>Cảnh báo:</strong> ${alerts.map(v=>`${esc(v.vehicle_name)} — ${v.n<0?'đã quá hạn '+Math.abs(v.n)+' ngày':v.n===0?'hết hạn hôm nay':'còn '+v.n+' ngày'}`).join(' · ')}</div>`:'';
+$('vehicleRows').querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{const v=vehicles.find(x=>String(x.id)===b.dataset.edit);if(!v)return;editingId=v.id;$('vehicleName').value=v.vehicle_name;$('startDate').value=v.start_date;$('endDate').value=v.end_date;$('notes').value=v.notes||'';$('formTitle').textContent='Sửa thông tin xe';$('saveVehicleBtn').textContent='Cập nhật';$('cancelEditBtn').classList.remove('hidden');window.scrollTo({top:0,behavior:'smooth'});});
+$('vehicleRows').querySelectorAll('[data-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Bạn chắc chắn muốn xóa xe này?'))return;try{await api('/api/vehicles/'+b.dataset.delete,{method:'DELETE'});await loadVehicles();}catch(e){alert(e.message);}});
+}
+$('search').oninput=renderVehicles;
+$('exportBtn').onclick=()=>{const rows=[['Bien so/Ten xe','Ngay bat dau','Ngay ket thuc','So ngay con lai','Trang thai','Ghi chu'],...vehicles.map(v=>{const n=daysRemaining(v.end_date);return [v.vehicle_name,fmtDate(v.start_date),fmtDate(v.end_date),n,statusFor(n).label,v.notes||''];})];const csv='\uFEFF'+rows.map(r=>r.map(x=>'"'+String(x??'').replace(/"/g,'""')+'"').join(',')).join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='3scooltrans-theo-doi-gio-cam.csv';a.click();URL.revokeObjectURL(url);};
+$('userForm').onsubmit=async e=>{e.preventDefault();$('userMessage').textContent='';try{await api('/api/users',{method:'POST',body:JSON.stringify({username:$('newUsername').value.trim(),password:$('newPassword').value,role:$('newRole').value})});$('userForm').reset();$('userMessage').textContent='Đã tạo tài khoản.';await loadUsers();}catch(err){$('userMessage').textContent=err.message;}};
+async function loadUsers(){if(!currentUser||currentUser.role!=='admin')return;const d=await api('/api/users');$('userRows').innerHTML=d.users.map(u=>`<tr><td>${esc(u.username)}</td><td>${u.role==='admin'?'Quản trị viên':'Nhân viên'}</td><td>${new Date(u.created_at).toLocaleDateString('vi-VN')}</td><td>${String(u.id)===String(currentUser.id)?'Đang sử dụng':`<button class="danger" data-user-delete="${u.id}">Xóa</button>`}</td></tr>`).join('');$('userRows').querySelectorAll('[data-user-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Xóa tài khoản này?'))return;try{await api('/api/users/'+b.dataset.userDelete,{method:'DELETE'});await loadUsers();}catch(e){alert(e.message);}});}
+async function refreshAll(){await loadVehicles();if(currentUser.role==='admin')await loadUsers();}
+(async()=>{try{const d=await api('/api/session');if(d.user){currentUser=d.user;showApp();await refreshAll();}}catch{}})();
+</script>
+</body></html>
