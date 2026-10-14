@@ -124,6 +124,17 @@ async function initDb() {
     );
     INSERT INTO email_alert_settings(id, recipients) VALUES(1, ARRAY[]::TEXT[]) ON CONFLICT (id) DO NOTHING;
   `);
+  // Persist each alert stage per vehicle and expiry date to prevent daily duplicate emails.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vehicle_email_alerts (
+      vehicle_id BIGINT PRIMARY KEY REFERENCES vehicles(id) ON DELETE CASCADE,
+      end_date DATE NOT NULL,
+      alert_20_sent_at TIMESTAMPTZ,
+      alert_10_sent_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_vehicle_email_alerts_end_date ON vehicle_email_alerts(end_date);
+  `);
   const { rows } = await pool.query("SELECT id FROM app_users WHERE username=$1", [process.env.BOOTSTRAP_ADMIN_USERNAME]);
   if (!rows.length) {
     const hash = await bcrypt.hash(process.env.BOOTSTRAP_ADMIN_PASSWORD, 12);
@@ -512,37 +523,88 @@ app.post('/api/admin/email-alerts/test', requireAdmin, async (req, res, next) =>
 });
 async function sendExpiryAlerts() {
   const mailer = createMailer();
-  if (!mailer) { console.warn('Email alert skipped: SMTP environment variables are not configured.'); return; }
+  if (!mailer) {
+    console.warn('Email alert skipped: SMTP environment variables are not configured.');
+    return;
+  }
+
   try {
     const settings = await pool.query('SELECT recipients FROM email_alert_settings WHERE id=1');
     const recipients = settings.rows[0]?.recipients || [];
     if (!recipients.length) return;
-    const { rows } = await pool.query(`
-      SELECT vehicle_name, end_date, (end_date - CURRENT_DATE)::int AS days_left
-      FROM vehicles WHERE end_date <= CURRENT_DATE + 20
-      ORDER BY end_date ASC, vehicle_name ASC
+
+    // Create or reset alert state whenever a vehicle's expiry date changes.
+    await pool.query(`
+      INSERT INTO vehicle_email_alerts(vehicle_id, end_date)
+      SELECT id, end_date FROM vehicles
+      ON CONFLICT (vehicle_id) DO UPDATE
+      SET end_date=EXCLUDED.end_date,
+          alert_20_sent_at=NULL,
+          alert_10_sent_at=NULL,
+          updated_at=NOW()
+      WHERE vehicle_email_alerts.end_date IS DISTINCT FROM EXCLUDED.end_date
     `);
-    if (!rows.length) return;
-    const lines = rows.map(v => {
-      const d = new Date(String(v.end_date).slice(0,10) + 'T00:00:00Z').toLocaleDateString('vi-VN', {timeZone:'UTC'});
-      const status = Number(v.days_left) < 0 ? `Đã quá hạn ${Math.abs(Number(v.days_left))} ngày` : Number(v.days_left) === 0 ? 'Hết hạn hôm nay' : `Còn ${v.days_left} ngày`;
-      return `- ${v.vehicle_name}: hết hạn ${d} (${status})`;
-    });
-    const subject = `[3SCooltrans] Cảnh báo giờ cấm: ${rows.length} xe còn hạn 20 ngày trở xuống`;
-    const textBody = `Danh sách xe có ngày hết hạn giờ cấm trong vòng 20 ngày tới hoặc đã hết hạn:\n\n${lines.join('\n')}\n\nVui lòng đăng nhập website 3SCooltrans để kiểm tra và gia hạn.`;
-    const htmlRows = rows.map(v => {
-      const date = new Date(String(v.end_date).slice(0,10) + 'T00:00:00Z').toLocaleDateString('vi-VN', {timeZone:'UTC'});
-      const n = Number(v.days_left);
-      const status = n < 0 ? `Đã quá hạn ${Math.abs(n)} ngày` : n === 0 ? 'Hết hạn hôm nay' : `Còn ${n} ngày`;
-      return `<tr><td style="padding:8px;border:1px solid #ddd">${String(v.vehicle_name).replace(/[&<>\"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}</td><td style="padding:8px;border:1px solid #ddd">${date}</td><td style="padding:8px;border:1px solid #ddd">${status}</td></tr>`;
-    }).join('');
-    await mailer.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: recipients.join(', '), subject, text: textBody,
-      html: `<div style="font-family:Arial,sans-serif"><h2>Cảnh báo giờ cấm xe</h2><p>Các xe có ngày hết hạn trong vòng 20 ngày tới hoặc đã hết hạn:</p><table style="border-collapse:collapse"><thead><tr><th style="padding:8px;border:1px solid #ddd">Xe</th><th style="padding:8px;border:1px solid #ddd">Ngày hết hạn</th><th style="padding:8px;border:1px solid #ddd">Tình trạng</th></tr></thead><tbody>${htmlRows}</tbody></table><p>Vui lòng đăng nhập website 3SCooltrans để kiểm tra và gia hạn.</p></div>`
-    });
-    console.log(`Expiry alert email sent to ${recipients.length} recipient(s); ${rows.length} vehicle(s) listed.`);
-  } catch (e) { console.error('Failed to send expiry alert email:', e.message); }
+
+    const { rows } = await pool.query(`
+      SELECT v.id, v.vehicle_name, v.end_date,
+             (v.end_date - CURRENT_DATE)::int AS days_left,
+             a.alert_20_sent_at, a.alert_10_sent_at
+      FROM vehicles v
+      JOIN vehicle_email_alerts a ON a.vehicle_id=v.id AND a.end_date=v.end_date
+      WHERE v.end_date <= CURRENT_DATE + 20
+      ORDER BY v.end_date ASC, v.vehicle_name ASC
+    `);
+
+    const twentyDayAlerts = [];
+    const tenDayAlerts = [];
+    for (const vehicle of rows) {
+      const daysLeft = Number(vehicle.days_left);
+      const sent20 = Boolean(vehicle.alert_20_sent_at);
+      const sent10 = Boolean(vehicle.alert_10_sent_at);
+
+      // If the service missed the exact 20-day date, send the first alert once when it next runs.
+      // Do not send the 10-day alert in the same run; keep the two notifications separate.
+      if (!sent20) {
+        twentyDayAlerts.push(vehicle);
+      } else if (daysLeft <= 10 && !sent10) {
+        tenDayAlerts.push(vehicle);
+      }
+    }
+
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    }[c]));
+    const formatDate = value => new Date(String(value).slice(0, 10) + 'T00:00:00Z')
+      .toLocaleDateString('vi-VN', { timeZone: 'UTC' });
+    const statusText = days => {
+      const n = Number(days);
+      return n < 0 ? `Đã quá hạn ${Math.abs(n)} ngày` : n === 0 ? 'Hết hạn hôm nay' : `Còn ${n} ngày`;
+    };
+
+    async function sendStageAlert(vehicles, stageDays) {
+      if (!vehicles.length) return;
+      const lines = vehicles.map(v => `- ${v.vehicle_name}: hết hạn ${formatDate(v.end_date)} (${statusText(v.days_left)})`);
+      const subject = `[3SCooltrans] Cảnh báo giờ cấm: mốc ${stageDays} ngày (${vehicles.length} xe)`;
+      const htmlRows = vehicles.map(v => `<tr><td style="padding:8px;border:1px solid #ddd">${escapeHtml(v.vehicle_name)}</td><td style="padding:8px;border:1px solid #ddd">${formatDate(v.end_date)}</td><td style="padding:8px;border:1px solid #ddd">${escapeHtml(statusText(v.days_left))}</td></tr>`).join('');
+      await mailer.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: recipients.join(', '),
+        subject,
+        text: `Cảnh báo mốc ${stageDays} ngày trước ngày hết hạn giờ cấm.\n\n${lines.join('\n')}\n\nVui lòng đăng nhập website 3SCooltrans để kiểm tra và gia hạn.`,
+        html: `<div style="font-family:Arial,sans-serif"><h2>Cảnh báo giờ cấm xe – mốc ${stageDays} ngày</h2><p>Danh sách xe cần kiểm tra:</p><table style="border-collapse:collapse"><thead><tr><th style="padding:8px;border:1px solid #ddd">Xe</th><th style="padding:8px;border:1px solid #ddd">Ngày hết hạn</th><th style="padding:8px;border:1px solid #ddd">Tình trạng</th></tr></thead><tbody>${htmlRows}</tbody></table><p>Vui lòng đăng nhập website 3SCooltrans để kiểm tra và gia hạn.</p></div>`
+      });
+      const ids = vehicles.map(v => v.id);
+      const column = stageDays === 20 ? 'alert_20_sent_at' : 'alert_10_sent_at';
+      await pool.query(`UPDATE vehicle_email_alerts SET ${column}=NOW(), updated_at=NOW() WHERE vehicle_id = ANY($1::bigint[])`, [ids]);
+      console.log(`Expiry ${stageDays}-day alert sent to ${recipients.length} recipient(s); ${vehicles.length} vehicle(s) listed.`);
+    }
+
+    // Mark sent only after SMTP succeeds, so a failed send can be retried on the next run.
+    await sendStageAlert(twentyDayAlerts, 20);
+    await sendStageAlert(tenDayAlerts, 10);
+  } catch (e) {
+    console.error('Failed to send expiry alert email:', e.message);
+  }
 }
 // Run once daily at 08:00 Vietnam time. SMTP settings are configured in Render environment variables.
 cron.schedule('0 8 * * *', sendExpiryAlerts, { timezone: 'Asia/Ho_Chi_Minh' });
