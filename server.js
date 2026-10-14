@@ -314,6 +314,63 @@ app.get("/api/vehicles/:id/renewal-history", requireAuth, async (req, res, next)
   } catch (e) { next(e); }
 });
 
+app.put("/api/vehicles/:id/renewal-history/:historyId", requireAuth, async (req, res, next) => {
+  try {
+    const vehicleId = req.params.id;
+    const historyId = req.params.historyId;
+    const renewal_date = req.body.renewal_date;
+    const valid_from = req.body.valid_from;
+    const valid_until = req.body.valid_until;
+    const amountRaw = req.body.amount;
+    const amount = Number(amountRaw);
+    const notes = String(req.body.notes || "").trim().slice(0, 1000);
+    const dateFields = [
+      req.body.progress_document_created_date,
+      req.body.progress_sent_to_vendor_date,
+      req.body.progress_accounting_paid_date,
+      req.body.progress_new_restriction_received_date
+    ];
+    if (!validDate(renewal_date) || !validDate(valid_from) || !validDate(valid_until)) {
+      return res.status(400).json({error:"Vui lòng nhập đủ ngày gia hạn, ngày bắt đầu và ngày hết hạn."});
+    }
+    if (valid_until < valid_from) return res.status(400).json({error:"Thời hạn đến ngày không được trước ngày bắt đầu."});
+    if (amountRaw === undefined || amountRaw === null || amountRaw === "" || !Number.isFinite(amount) || amount < 0) {
+      return res.status(400).json({error:"Số tiền không hợp lệ."});
+    }
+    const progress = dateFields.map(value => {
+      if (value === null || value === undefined || value === "") return null;
+      if (!validDate(value)) throw new Error("Ngày trong tiến độ hồ sơ không hợp lệ.");
+      return value;
+    });
+    const { rows } = await pool.query(
+      `UPDATE vehicle_renewal_history SET renewal_date=$1, amount=$2, valid_from=$3, valid_until=$4, notes=$5,
+       progress_document_created_date=$6, progress_sent_to_vendor_date=$7,
+       progress_accounting_paid_date=$8, progress_new_restriction_received_date=$9
+       WHERE id=$10 AND vehicle_id=$11
+       RETURNING id, to_char(renewal_date,'YYYY-MM-DD') AS renewal_date, amount::text AS amount,
+       to_char(valid_from,'YYYY-MM-DD') AS valid_from, to_char(valid_until,'YYYY-MM-DD') AS valid_until, notes,
+       to_char(progress_document_created_date,'YYYY-MM-DD') AS progress_document_created_date,
+       to_char(progress_sent_to_vendor_date,'YYYY-MM-DD') AS progress_sent_to_vendor_date,
+       to_char(progress_accounting_paid_date,'YYYY-MM-DD') AS progress_accounting_paid_date,
+       to_char(progress_new_restriction_received_date,'YYYY-MM-DD') AS progress_new_restriction_received_date`,
+      [renewal_date, amount, valid_from, valid_until, notes, ...progress, historyId, vehicleId]
+    );
+    if (!rows.length) return res.status(404).json({error:"Không tìm thấy lần gia hạn này."});
+    res.json({record:rows[0]});
+  } catch (e) { if (e.message && !e.code) return res.status(400).json({error:e.message}); next(e); }
+});
+
+app.delete("/api/vehicles/:id/renewal-history/:historyId", requireAuth, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      "DELETE FROM vehicle_renewal_history WHERE id=$1 AND vehicle_id=$2",
+      [req.params.historyId, req.params.id]
+    );
+    if (!result.rowCount) return res.status(404).json({error:"Không tìm thấy lần gia hạn này."});
+    res.json({ok:true});
+  } catch (e) { next(e); }
+});
+
 app.post("/api/vehicles/:id/renewal-history", requireAuth, async (req, res, next) => {
   try {
     const vehicleId = req.params.id;
