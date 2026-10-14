@@ -8,6 +8,8 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const path = require("path");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer");
+const cron = require("node-cron");
 
 const app = express();
 const isProd = process.env.NODE_ENV === "production";
@@ -112,6 +114,15 @@ async function initDb() {
     ALTER TABLE vehicle_renewal_history ADD COLUMN IF NOT EXISTS progress_new_restriction_received_date DATE;
     CREATE INDEX IF NOT EXISTS idx_vehicle_renewal_history_vehicle_date
       ON vehicle_renewal_history(vehicle_id, renewal_date DESC, id DESC);
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS email_alert_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      recipients TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_by BIGINT REFERENCES app_users(id)
+    );
+    INSERT INTO email_alert_settings(id, recipients) VALUES(1, ARRAY[]::TEXT[]) ON CONFLICT (id) DO NOTHING;
   `);
   const { rows } = await pool.query("SELECT id FROM app_users WHERE username=$1", [process.env.BOOTSTRAP_ADMIN_USERNAME]);
   if (!rows.length) {
@@ -445,6 +456,96 @@ app.delete("/api/vehicles/:id", requirePermission("delete_vehicle"), async (req,
     res.json({ok:true});
   } catch (e) { next(e); }
 });
+
+// Email alert recipients can be configured only by an administrator.
+function cleanEmailList(input) {
+  const values = Array.isArray(input) ? input : String(input || '').split(/[\n,;]+/);
+  const emails = [...new Set(values.map(v => String(v || '').trim().toLowerCase()).filter(Boolean))];
+  if (emails.length > 50) throw new Error('Tối đa 50 địa chỉ email.');
+  const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (emails.some(email => email.length > 254 || !valid.test(email))) throw new Error('Có địa chỉ email không hợp lệ.');
+  return emails;
+}
+function createMailer() {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) return null;
+  const port = Number(process.env.SMTP_PORT || 587);
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port,
+    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+  });
+}
+function emailSettingsStatus() {
+  return { smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS), from: process.env.SMTP_FROM || process.env.SMTP_USER || '' };
+}
+app.get('/api/admin/email-alerts', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT recipients, updated_at FROM email_alert_settings WHERE id=1');
+    res.json({ recipients: rows[0]?.recipients || [], updated_at: rows[0]?.updated_at || null, ...emailSettingsStatus() });
+  } catch (e) { next(e); }
+});
+app.put('/api/admin/email-alerts', requireAdmin, async (req, res, next) => {
+  try {
+    const recipients = cleanEmailList(req.body.recipients);
+    const { rows } = await pool.query(
+      'UPDATE email_alert_settings SET recipients=$1, updated_at=NOW(), updated_by=$2 WHERE id=1 RETURNING recipients, updated_at',
+      [recipients, req.session.user.id]
+    );
+    res.json({ recipients: rows[0].recipients, updated_at: rows[0].updated_at, ...emailSettingsStatus() });
+  } catch (e) { if (e.message.includes('email') || e.message.includes('50 địa')) return res.status(400).json({error:e.message}); next(e); }
+});
+app.post('/api/admin/email-alerts/test', requireAdmin, async (req, res, next) => {
+  try {
+    const recipients = cleanEmailList(req.body.recipients || []);
+    if (!recipients.length) return res.status(400).json({error:'Nhập ít nhất một địa chỉ email để gửi thử.'});
+    const mailer = createMailer();
+    if (!mailer) return res.status(503).json({error:'Chưa cấu hình SMTP trên Render. Hãy thêm SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS và SMTP_FROM.'});
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipients.join(', '),
+      subject: '[3SCooltrans] Email kiểm tra cảnh báo giờ cấm',
+      text: 'Đây là email kiểm tra từ website 3SCooltrans. Nếu bạn nhận được email này, cấu hình gửi mail đang hoạt động.'
+    });
+    res.json({ok:true});
+  } catch (e) { if (e.message.includes('email') || e.message.includes('50 địa')) return res.status(400).json({error:e.message}); next(e); }
+});
+async function sendExpiryAlerts() {
+  const mailer = createMailer();
+  if (!mailer) { console.warn('Email alert skipped: SMTP environment variables are not configured.'); return; }
+  try {
+    const settings = await pool.query('SELECT recipients FROM email_alert_settings WHERE id=1');
+    const recipients = settings.rows[0]?.recipients || [];
+    if (!recipients.length) return;
+    const { rows } = await pool.query(`
+      SELECT vehicle_name, end_date, (end_date - CURRENT_DATE)::int AS days_left
+      FROM vehicles WHERE end_date <= CURRENT_DATE + 20
+      ORDER BY end_date ASC, vehicle_name ASC
+    `);
+    if (!rows.length) return;
+    const lines = rows.map(v => {
+      const d = new Date(String(v.end_date).slice(0,10) + 'T00:00:00Z').toLocaleDateString('vi-VN', {timeZone:'UTC'});
+      const status = Number(v.days_left) < 0 ? `Đã quá hạn ${Math.abs(Number(v.days_left))} ngày` : Number(v.days_left) === 0 ? 'Hết hạn hôm nay' : `Còn ${v.days_left} ngày`;
+      return `- ${v.vehicle_name}: hết hạn ${d} (${status})`;
+    });
+    const subject = `[3SCooltrans] Cảnh báo giờ cấm: ${rows.length} xe còn hạn 20 ngày trở xuống`;
+    const textBody = `Danh sách xe có ngày hết hạn giờ cấm trong vòng 20 ngày tới hoặc đã hết hạn:\n\n${lines.join('\n')}\n\nVui lòng đăng nhập website 3SCooltrans để kiểm tra và gia hạn.`;
+    const htmlRows = rows.map(v => {
+      const date = new Date(String(v.end_date).slice(0,10) + 'T00:00:00Z').toLocaleDateString('vi-VN', {timeZone:'UTC'});
+      const n = Number(v.days_left);
+      const status = n < 0 ? `Đã quá hạn ${Math.abs(n)} ngày` : n === 0 ? 'Hết hạn hôm nay' : `Còn ${n} ngày`;
+      return `<tr><td style="padding:8px;border:1px solid #ddd">${String(v.vehicle_name).replace(/[&<>\"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}</td><td style="padding:8px;border:1px solid #ddd">${date}</td><td style="padding:8px;border:1px solid #ddd">${status}</td></tr>`;
+    }).join('');
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipients.join(', '), subject, text: textBody,
+      html: `<div style="font-family:Arial,sans-serif"><h2>Cảnh báo giờ cấm xe</h2><p>Các xe có ngày hết hạn trong vòng 20 ngày tới hoặc đã hết hạn:</p><table style="border-collapse:collapse"><thead><tr><th style="padding:8px;border:1px solid #ddd">Xe</th><th style="padding:8px;border:1px solid #ddd">Ngày hết hạn</th><th style="padding:8px;border:1px solid #ddd">Tình trạng</th></tr></thead><tbody>${htmlRows}</tbody></table><p>Vui lòng đăng nhập website 3SCooltrans để kiểm tra và gia hạn.</p></div>`
+    });
+    console.log(`Expiry alert email sent to ${recipients.length} recipient(s); ${rows.length} vehicle(s) listed.`);
+  } catch (e) { console.error('Failed to send expiry alert email:', e.message); }
+}
+// Run once daily at 08:00 Vietnam time. SMTP settings are configured in Render environment variables.
+cron.schedule('0 8 * * *', sendExpiryAlerts, { timezone: 'Asia/Ho_Chi_Minh' });
 
 // User management is restricted to admins. Passwords are never returned by the API.
 app.get("/api/users", requireAdmin, async (req, res, next) => {
