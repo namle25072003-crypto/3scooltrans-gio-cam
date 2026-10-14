@@ -67,6 +67,8 @@
   <div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" id="saveAlertEmailsBtn">Lưu email nhận thông báo</button><button type="button" id="testAlertEmailsBtn" class="secondary">Gửi email thử</button></div>
   <p class="muted" style="margin-bottom:0">Cần cấu hình SMTP trên Render để gửi email thật. Không nhập mật khẩu email tại đây.</p>
 </div>
+<button type="button" id="toggleCreateUserFormBtn" aria-expanded="false" style="width:100%;margin:0 0 12px;text-align:left;display:flex;align-items:center;justify-content:space-between;gap:12px"><span>＋ Tạo tài khoản</span><span id="createUserChevron" aria-hidden="true">▼</span></button>
+<div id="createUserFormPanel" class="hidden">
 <form id="userForm" class="user-form">
 <div><label for="newUsername">Tên đăng nhập</label><input id="newUsername" required minlength="3" maxlength="40" placeholder="vd: nhanvien01"></div>
 <div><label for="newPassword">Mật khẩu</label><div class="password-wrap"><input id="newPassword" type="password" required autocomplete="new-password" placeholder="Tự đặt mật khẩu"><button type="button" id="toggleNewPassword" class="secondary" aria-label="Hiện hoặc ẩn mật khẩu">👁</button></div><div class="muted">Mật khẩu không giới hạn độ dài tối thiểu; không để trống.</div></div>
@@ -75,6 +77,7 @@
 <label><input type="checkbox" data-new-perm="view_vehicles" checked> Xem danh sách xe</label><label><input type="checkbox" data-new-perm="add_vehicle" checked> Thêm xe</label><label><input type="checkbox" data-new-perm="edit_vehicle" checked> Sửa thông tin xe</label><label><input type="checkbox" data-new-perm="delete_vehicle"> Xóa xe</label><label><input type="checkbox" data-new-perm="progress" checked> Cập nhật tiến độ hồ sơ</label><label><input type="checkbox" data-new-perm="view_history" checked> Xem lịch sử gia hạn</label><label><input type="checkbox" data-new-perm="edit_history"> Sửa/thêm lịch sử gia hạn</label><label><input type="checkbox" data-new-perm="delete_history"> Xóa lịch sử gia hạn</label><label><input type="checkbox" data-new-perm="export_csv" checked> Xuất file Excel/CSV</label></div></div>
 <button type="submit">Tạo tài khoản</button>
 </form><div id="userMessage" class="muted" style="margin:10px 0"></div>
+</div>
 <div class="table-wrap"><table><thead><tr><th>Tài khoản</th><th>Vai trò</th><th>Ngày tạo</th><th>Phân quyền / thao tác</th></tr></thead><tbody id="userRows"></tbody></table></div>
 </section>
 </section>
@@ -206,4 +209,21 @@ $('userRows').querySelectorAll('[data-user-delete]').forEach(b=>b.onclick=async(
 async function refreshAll(){try{await loadVehicles();}catch(err){if(err.message.includes('chưa được cấp quyền')){$('vehicleRows').innerHTML='<tr><td colspan="7" class="empty">Tài khoản chưa được cấp quyền xem danh sách xe.</td></tr>'; }else throw err;}if(currentUser.role==='admin'){await loadUsers();await loadEmailAlertSettings();}}
 (async()=>{try{const d=await api('/api/session');if(d.user){currentUser=d.user;showApp();await refreshAll();}}catch{}})();
 </script>
+
+<script>
+(() => {
+  const toggle = document.getElementById('toggleCreateUserFormBtn');
+  const panel = document.getElementById('createUserFormPanel');
+  const chevron = document.getElementById('createUserChevron');
+  if (!toggle || !panel) return;
+  toggle.addEventListener('click', () => {
+    const opening = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !opening);
+    toggle.setAttribute('aria-expanded', String(opening));
+    toggle.querySelector('span').textContent = opening ? '− Đóng phần tạo tài khoản' : '＋ Tạo tài khoản';
+    if (chevron) chevron.textContent = opening ? '▲' : '▼';
+  });
+})();
+</script>
+
 </body></html>
