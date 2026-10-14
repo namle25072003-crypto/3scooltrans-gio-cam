@@ -210,14 +210,34 @@ app.post("/api/vehicles", requireAuth, async (req, res, next) => {
 });
 
 app.put("/api/vehicles/:id", requireAuth, async (req, res, next) => {
+  const client = await pool.connect();
   try {
     const v = cleanVehicle(req.body);
-    const { rows } = await pool.query(
+    await client.query("BEGIN");
+    const currentResult = await client.query(
+      `SELECT id, start_date, end_date, document_created_date, sent_to_vendor_date,
+              accounting_paid_date, new_restriction_received_date
+       FROM vehicles WHERE id=$1 FOR UPDATE`, [req.params.id]
+    );
+    if (!currentResult.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({error:"Không tìm thấy xe."});
+    }
+    const old = currentResult.rows[0];
+    const oldEndDate = old.end_date instanceof Date ? old.end_date.toISOString().slice(0,10) : String(old.end_date).slice(0,10);
+    const expiryChanged = oldEndDate !== v.end_date;
+    let amount = null;
+    if (expiryChanged) {
+      const raw = req.body.renewal_amount;
+      amount = Number(raw);
+      if (raw === undefined || raw === null || raw === "" || !Number.isFinite(amount) || amount < 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({error:"Bạn đã đổi ngày hết hạn. Vui lòng nhập chi phí gia hạn (có thể nhập 0 nếu miễn phí) để tự lưu lịch sử."});
+      }
+    }
+    const { rows } = await client.query(
       `UPDATE vehicles
-       SET vehicle_name=$1,
-           start_date=$2,
-           end_date=$3,
-           notes=$4,
+       SET vehicle_name=$1, start_date=$2, end_date=$3, notes=$4,
            document_created_date=CASE WHEN end_date IS DISTINCT FROM $3::date THEN NULL ELSE document_created_date END,
            sent_to_vendor_date=CASE WHEN end_date IS DISTINCT FROM $3::date THEN NULL ELSE sent_to_vendor_date END,
            accounting_paid_date=CASE WHEN end_date IS DISTINCT FROM $3::date THEN NULL ELSE accounting_paid_date END,
@@ -228,9 +248,28 @@ app.put("/api/vehicles/:id", requireAuth, async (req, res, next) => {
        to_char(end_date,'YYYY-MM-DD') AS end_date,notes`,
       [v.vehicle_name,v.start_date,v.end_date,v.notes,req.params.id]
     );
-    if (!rows.length) return res.status(404).json({error:"Không tìm thấy xe."});
-    res.json({vehicle:rows[0]});
-  } catch (e) { if (e.message && !e.code) return res.status(400).json({error:e.message}); next(e); }
+    if (expiryChanged) {
+      const receivedDate = old.new_restriction_received_date
+        ? (old.new_restriction_received_date instanceof Date ? old.new_restriction_received_date.toISOString().slice(0,10) : String(old.new_restriction_received_date).slice(0,10))
+        : new Date().toISOString().slice(0,10);
+      await client.query(
+        `INSERT INTO vehicle_renewal_history(
+           vehicle_id, renewal_date, amount, valid_from, valid_until, notes, created_by,
+           progress_document_created_date, progress_sent_to_vendor_date,
+           progress_accounting_paid_date, progress_new_restriction_received_date
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [req.params.id, receivedDate, amount, v.start_date, v.end_date, v.notes,
+         req.session.user.id, old.document_created_date, old.sent_to_vendor_date,
+         old.accounting_paid_date, old.new_restriction_received_date]
+      );
+    }
+    await client.query("COMMIT");
+    res.json({vehicle:rows[0], history_saved:expiryChanged});
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    if (e.message && !e.code) return res.status(400).json({error:e.message});
+    next(e);
+  } finally { client.release(); }
 });
 
 app.put("/api/vehicles/:id/progress", requireAuth, async (req, res, next) => {
