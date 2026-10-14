@@ -460,7 +460,7 @@ app.post("/api/users", requireAdmin, async (req, res, next) => {
     const role = req.body.role === "admin" ? "admin" : "staff";
     const permissions = role === "admin" ? {} : normalizePermissions(req.body.permissions);
     if (!/^[a-zA-Z0-9._-]{3,40}$/.test(username)) return res.status(400).json({error:"Tên đăng nhập 3–40 ký tự, chỉ gồm chữ, số, dấu chấm, gạch ngang hoặc gạch dưới."});
-    if (password.length < 12) return res.status(400).json({error:"Mật khẩu phải có ít nhất 12 ký tự."});
+    if (!password.length) return res.status(400).json({error:"Vui lòng nhập mật khẩu."});
     const hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
       "INSERT INTO app_users(username,password_hash,role,permissions) VALUES($1,$2,$3,$4) RETURNING id,username,role,permissions,created_at",
@@ -471,6 +471,16 @@ app.post("/api/users", requireAdmin, async (req, res, next) => {
     if (e.code === "23505") return res.status(409).json({error:"Tên đăng nhập đã tồn tại."});
     next(e);
   }
+});
+app.put("/api/users/:id/password", requireAdmin, async (req, res, next) => {
+  try {
+    const password = String(req.body.password ?? "");
+    if (!password.length) return res.status(400).json({error:"Vui lòng nhập mật khẩu mới."});
+    const hash = await bcrypt.hash(password, 12);
+    const result = await pool.query("UPDATE app_users SET password_hash=$1 WHERE id=$2 RETURNING id,username,role", [hash, req.params.id]);
+    if (!result.rows.length) return res.status(404).json({error:"Không tìm thấy tài khoản."});
+    res.json({ok:true, user:result.rows[0]});
+  } catch (e) { next(e); }
 });
 app.put("/api/users/:id/permissions", requireAdmin, async (req, res, next) => {
   try {
