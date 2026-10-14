@@ -155,6 +155,21 @@ app.post("/api/logout", requireAuth, (req, res, next) => {
 
 app.get("/api/vehicles", requireAuth, async (req, res, next) => {
   try {
+    // Automatically restart a completed 4/4 workflow 20 days before the current permit expires.
+    // Only the four workflow dates are cleared; vehicle and permit dates remain unchanged.
+    await pool.query(
+      `UPDATE vehicles
+       SET document_created_date=NULL,
+           sent_to_vendor_date=NULL,
+           accounting_paid_date=NULL,
+           new_restriction_received_date=NULL,
+           updated_at=NOW()
+       WHERE end_date <= CURRENT_DATE + INTERVAL '20 days'
+         AND document_created_date IS NOT NULL
+         AND sent_to_vendor_date IS NOT NULL
+         AND accounting_paid_date IS NOT NULL
+         AND new_restriction_received_date IS NOT NULL`
+    );
     const { rows } = await pool.query(
       `SELECT id,vehicle_name,
         to_char(start_date,'YYYY-MM-DD') AS start_date,
