@@ -63,6 +63,7 @@ async function initDb() {
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'staff' CHECK (role IN ('admin','staff')),
+      permissions JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS vehicles (
@@ -77,6 +78,9 @@ async function initDb() {
       CHECK (end_date >= start_date)
     );
   `);
+  await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb");
+  // Existing staff retain standard vehicle workflows; admins always have full access.
+  await pool.query(`UPDATE app_users SET permissions = '{"view_vehicles":true,"add_vehicle":true,"edit_vehicle":true,"delete_vehicle":true,"progress":true,"view_history":true,"edit_history":true,"delete_history":true,"export_csv":true}'::jsonb WHERE role='staff' AND permissions='{}'::jsonb`);
   // Add workflow date fields safely for existing installations; existing vehicle data is preserved.
   await pool.query(`
     ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS document_created_date DATE;
@@ -124,6 +128,19 @@ function requireAuth(req, res, next) {
   if (!req.session.user) return res.status(401).json({ error: "Vui lòng đăng nhập." });
   next();
 }
+function requirePermission(permission) {
+  return (req, res, next) => {
+    if (!req.session.user) return res.status(401).json({ error: "Vui lòng đăng nhập." });
+    if (req.session.user.role === "admin" || req.session.user.permissions?.[permission] === true) return next();
+    return res.status(403).json({ error: "Tài khoản của bạn chưa được cấp quyền chức năng này. Vui lòng liên hệ quản trị viên." });
+  };
+}
+function normalizePermissions(input) {
+  const keys = ["view_vehicles","add_vehicle","edit_vehicle","delete_vehicle","progress","view_history","edit_history","delete_history","export_csv"];
+  const out = {};
+  for (const key of keys) out[key] = input && input[key] === true;
+  return out;
+}
 function requireAdmin(req, res, next) {
   if (!req.session.user || req.session.user.role !== "admin") {
     return res.status(403).json({ error: "Chỉ quản trị viên được thực hiện thao tác này." });
@@ -145,14 +162,22 @@ function cleanVehicle(body) {
 }
 
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
-app.get("/api/session", (req, res) => res.json({ user: req.session.user || null }));
+app.get("/api/session", async (req, res, next) => {
+  try {
+    if (!req.session.user) return res.json({ user: null });
+    const { rows } = await pool.query("SELECT id,username,role,permissions FROM app_users WHERE id=$1", [req.session.user.id]);
+    if (!rows.length) { req.session.destroy(() => {}); return res.json({ user: null }); }
+    req.session.user = rows[0];
+    res.json({ user: req.session.user });
+  } catch (e) { next(e); }
+});
 
 app.post("/api/login", loginLimiter, async (req, res, next) => {
   try {
     const username = String(req.body.username || "").trim();
     const password = String(req.body.password || "");
     const result = await pool.query(
-      "SELECT id,username,password_hash,role FROM app_users WHERE username=$1",
+      "SELECT id,username,password_hash,role,permissions FROM app_users WHERE username=$1",
       [username]
     );
     const user = result.rows[0];
@@ -161,7 +186,7 @@ app.post("/api/login", loginLimiter, async (req, res, next) => {
     }
     req.session.regenerate(err => {
       if (err) return next(err);
-      req.session.user = { id: user.id, username: user.username, role: user.role };
+      req.session.user = { id: user.id, username: user.username, role: user.role, permissions: user.permissions || {} };
       req.session.save(err2 => {
         if (err2) return next(err2);
         res.json({ user: req.session.user });
@@ -178,7 +203,7 @@ app.post("/api/logout", requireAuth, (req, res, next) => {
   });
 });
 
-app.get("/api/vehicles", requireAuth, async (req, res, next) => {
+app.get("/api/vehicles", requirePermission("view_vehicles"), async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       `SELECT id,vehicle_name,
@@ -195,7 +220,7 @@ app.get("/api/vehicles", requireAuth, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-app.post("/api/vehicles", requireAuth, async (req, res, next) => {
+app.post("/api/vehicles", requirePermission("add_vehicle"), async (req, res, next) => {
   try {
     const v = cleanVehicle(req.body);
     const { rows } = await pool.query(
@@ -209,7 +234,7 @@ app.post("/api/vehicles", requireAuth, async (req, res, next) => {
   } catch (e) { if (e.message && !e.code) return res.status(400).json({error:e.message}); next(e); }
 });
 
-app.put("/api/vehicles/:id", requireAuth, async (req, res, next) => {
+app.put("/api/vehicles/:id", requirePermission("edit_vehicle"), async (req, res, next) => {
   const client = await pool.connect();
   try {
     const v = cleanVehicle(req.body);
@@ -272,7 +297,7 @@ app.put("/api/vehicles/:id", requireAuth, async (req, res, next) => {
   } finally { client.release(); }
 });
 
-app.put("/api/vehicles/:id/progress", requireAuth, async (req, res, next) => {
+app.put("/api/vehicles/:id/progress", requirePermission("progress"), async (req, res, next) => {
   try {
     const fields = ["document_created_date", "sent_to_vendor_date", "accounting_paid_date", "new_restriction_received_date"];
     const values = fields.map(field => {
@@ -295,7 +320,7 @@ app.put("/api/vehicles/:id/progress", requireAuth, async (req, res, next) => {
   } catch (e) { if (e.message && !e.code) return res.status(400).json({error:e.message}); next(e); }
 });
 
-app.get("/api/vehicles/:id/renewal-history", requireAuth, async (req, res, next) => {
+app.get("/api/vehicles/:id/renewal-history", requirePermission("view_history"), async (req, res, next) => {
   try {
     const vehicle = await pool.query("SELECT id, vehicle_name FROM vehicles WHERE id=$1", [req.params.id]);
     if (!vehicle.rowCount) return res.status(404).json({error:"Không tìm thấy xe."});
@@ -314,7 +339,7 @@ app.get("/api/vehicles/:id/renewal-history", requireAuth, async (req, res, next)
   } catch (e) { next(e); }
 });
 
-app.put("/api/vehicles/:id/renewal-history/:historyId", requireAuth, async (req, res, next) => {
+app.put("/api/vehicles/:id/renewal-history/:historyId", requirePermission("edit_history"), async (req, res, next) => {
   try {
     const vehicleId = req.params.id;
     const historyId = req.params.historyId;
@@ -360,7 +385,7 @@ app.put("/api/vehicles/:id/renewal-history/:historyId", requireAuth, async (req,
   } catch (e) { if (e.message && !e.code) return res.status(400).json({error:e.message}); next(e); }
 });
 
-app.delete("/api/vehicles/:id/renewal-history/:historyId", requireAuth, async (req, res, next) => {
+app.delete("/api/vehicles/:id/renewal-history/:historyId", requirePermission("delete_history"), async (req, res, next) => {
   try {
     const result = await pool.query(
       "DELETE FROM vehicle_renewal_history WHERE id=$1 AND vehicle_id=$2",
@@ -371,7 +396,7 @@ app.delete("/api/vehicles/:id/renewal-history/:historyId", requireAuth, async (r
   } catch (e) { next(e); }
 });
 
-app.post("/api/vehicles/:id/renewal-history", requireAuth, async (req, res, next) => {
+app.post("/api/vehicles/:id/renewal-history", requirePermission("edit_history"), async (req, res, next) => {
   try {
     const vehicleId = req.params.id;
     const vehicle = await pool.query(
@@ -413,7 +438,7 @@ app.post("/api/vehicles/:id/renewal-history", requireAuth, async (req, res, next
   } catch (e) { next(e); }
 });
 
-app.delete("/api/vehicles/:id", requireAuth, async (req, res, next) => {
+app.delete("/api/vehicles/:id", requirePermission("delete_vehicle"), async (req, res, next) => {
   try {
     const result = await pool.query("DELETE FROM vehicles WHERE id=$1", [req.params.id]);
     if (!result.rowCount) return res.status(404).json({error:"Không tìm thấy xe."});
@@ -424,7 +449,7 @@ app.delete("/api/vehicles/:id", requireAuth, async (req, res, next) => {
 // User management is restricted to admins. Passwords are never returned by the API.
 app.get("/api/users", requireAdmin, async (req, res, next) => {
   try {
-    const { rows } = await pool.query("SELECT id,username,role,created_at FROM app_users ORDER BY id");
+    const { rows } = await pool.query("SELECT id,username,role,permissions,created_at FROM app_users ORDER BY id");
     res.json({users:rows});
   } catch (e) { next(e); }
 });
@@ -433,18 +458,31 @@ app.post("/api/users", requireAdmin, async (req, res, next) => {
     const username = String(req.body.username || "").trim();
     const password = String(req.body.password || "");
     const role = req.body.role === "admin" ? "admin" : "staff";
+    const permissions = role === "admin" ? {} : normalizePermissions(req.body.permissions);
     if (!/^[a-zA-Z0-9._-]{3,40}$/.test(username)) return res.status(400).json({error:"Tên đăng nhập 3–40 ký tự, chỉ gồm chữ, số, dấu chấm, gạch ngang hoặc gạch dưới."});
     if (password.length < 12) return res.status(400).json({error:"Mật khẩu phải có ít nhất 12 ký tự."});
     const hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
-      "INSERT INTO app_users(username,password_hash,role) VALUES($1,$2,$3) RETURNING id,username,role,created_at",
-      [username,hash,role]
+      "INSERT INTO app_users(username,password_hash,role,permissions) VALUES($1,$2,$3,$4) RETURNING id,username,role,permissions,created_at",
+      [username,hash,role,JSON.stringify(permissions)]
     );
     res.status(201).json({user:rows[0]});
   } catch (e) {
     if (e.code === "23505") return res.status(409).json({error:"Tên đăng nhập đã tồn tại."});
     next(e);
   }
+});
+app.put("/api/users/:id/permissions", requireAdmin, async (req, res, next) => {
+  try {
+    if (String(req.session.user.id) === String(req.params.id)) return res.status(400).json({error:"Không thể thay đổi quyền của tài khoản quản trị đang sử dụng."});
+    const permissions = normalizePermissions(req.body.permissions);
+    const { rows } = await pool.query(
+      "UPDATE app_users SET permissions=$1::jsonb WHERE id=$2 AND role='staff' RETURNING id,username,role,permissions,created_at",
+      [JSON.stringify(permissions), req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({error:"Không tìm thấy tài khoản nhân viên."});
+    res.json({user:rows[0]});
+  } catch (e) { next(e); }
 });
 app.delete("/api/users/:id", requireAdmin, async (req, res, next) => {
   try {
