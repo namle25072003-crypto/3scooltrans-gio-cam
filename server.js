@@ -77,6 +77,13 @@ async function initDb() {
       CHECK (end_date >= start_date)
     );
   `);
+  // Add workflow date fields safely for existing installations; existing vehicle data is preserved.
+  await pool.query(`
+    ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS document_created_date DATE;
+    ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS sent_to_vendor_date DATE;
+    ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS accounting_paid_date DATE;
+    ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS new_restriction_received_date DATE;
+  `);
   const { rows } = await pool.query("SELECT id FROM app_users WHERE username=$1", [process.env.BOOTSTRAP_ADMIN_USERNAME]);
   if (!rows.length) {
     const hash = await bcrypt.hash(process.env.BOOTSTRAP_ADMIN_PASSWORD, 12);
@@ -152,7 +159,11 @@ app.get("/api/vehicles", requireAuth, async (req, res, next) => {
       `SELECT id,vehicle_name,
         to_char(start_date,'YYYY-MM-DD') AS start_date,
         to_char(end_date,'YYYY-MM-DD') AS end_date,
-        notes,created_at,updated_at
+        notes,created_at,updated_at,
+        to_char(document_created_date,'YYYY-MM-DD') AS document_created_date,
+        to_char(sent_to_vendor_date,'YYYY-MM-DD') AS sent_to_vendor_date,
+        to_char(accounting_paid_date,'YYYY-MM-DD') AS accounting_paid_date,
+        to_char(new_restriction_received_date,'YYYY-MM-DD') AS new_restriction_received_date
        FROM vehicles ORDER BY end_date ASC, vehicle_name ASC`
     );
     res.json({ vehicles: rows });
@@ -182,6 +193,29 @@ app.put("/api/vehicles/:id", requireAuth, async (req, res, next) => {
        RETURNING id,vehicle_name,to_char(start_date,'YYYY-MM-DD') AS start_date,
        to_char(end_date,'YYYY-MM-DD') AS end_date,notes`,
       [v.vehicle_name,v.start_date,v.end_date,v.notes,req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({error:"Không tìm thấy xe."});
+    res.json({vehicle:rows[0]});
+  } catch (e) { if (e.message && !e.code) return res.status(400).json({error:e.message}); next(e); }
+});
+
+app.put("/api/vehicles/:id/progress", requireAuth, async (req, res, next) => {
+  try {
+    const fields = ["document_created_date", "sent_to_vendor_date", "accounting_paid_date", "new_restriction_received_date"];
+    const values = fields.map(field => {
+      const value = req.body[field];
+      if (value === null || value === undefined || value === "") return null;
+      if (!validDate(value)) throw new Error("Ngày trong tiến độ hồ sơ không hợp lệ.");
+      return value;
+    });
+    const { rows } = await pool.query(
+      `UPDATE vehicles SET document_created_date=$1,sent_to_vendor_date=$2,accounting_paid_date=$3,new_restriction_received_date=$4,updated_at=NOW()
+       WHERE id=$5
+       RETURNING id,vehicle_name,to_char(document_created_date,'YYYY-MM-DD') AS document_created_date,
+       to_char(sent_to_vendor_date,'YYYY-MM-DD') AS sent_to_vendor_date,
+       to_char(accounting_paid_date,'YYYY-MM-DD') AS accounting_paid_date,
+       to_char(new_restriction_received_date,'YYYY-MM-DD') AS new_restriction_received_date`,
+      [...values, req.params.id]
     );
     if (!rows.length) return res.status(404).json({error:"Không tìm thấy xe."});
     res.json({vehicle:rows[0]});
