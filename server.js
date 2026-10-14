@@ -83,6 +83,26 @@ async function initDb() {
   await pool.query("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb");
   // Existing staff retain standard vehicle workflows; admins always have full access.
   await pool.query(`UPDATE app_users SET permissions = '{"view_vehicles":true,"add_vehicle":true,"edit_vehicle":true,"delete_vehicle":true,"progress":true,"view_history":true,"edit_history":true,"delete_history":true,"export_csv":true}'::jsonb WHERE role='staff' AND permissions='{}'::jsonb`);
+  // Insurance policies are managed separately from restricted-hours records.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vehicle_insurances (
+      id BIGSERIAL PRIMARY KEY,
+      vehicle_name TEXT NOT NULL,
+      insurance_type TEXT NOT NULL DEFAULT 'Bảo hiểm trách nhiệm dân sự',
+      insurer TEXT NOT NULL DEFAULT '',
+      policy_number TEXT NOT NULL DEFAULT '',
+      start_date DATE NOT NULL,
+      end_date DATE NOT NULL,
+      premium NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (premium >= 0),
+      notes TEXT NOT NULL DEFAULT '',
+      created_by BIGINT REFERENCES app_users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CHECK (end_date >= start_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_vehicle_insurances_end_date ON vehicle_insurances(end_date);
+  `);
+  await pool.query(`UPDATE app_users SET permissions = permissions || jsonb_build_object('view_insurance', COALESCE(permissions->'view_insurance','false'::jsonb), 'add_insurance', COALESCE(permissions->'add_insurance','false'::jsonb), 'edit_insurance', COALESCE(permissions->'edit_insurance','false'::jsonb), 'delete_insurance', COALESCE(permissions->'delete_insurance','false'::jsonb)) WHERE role='staff'`);
   // Add workflow date fields safely for existing installations; existing vehicle data is preserved.
   await pool.query(`
     ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS document_created_date DATE;
@@ -158,7 +178,7 @@ function requirePermission(permission) {
   };
 }
 function normalizePermissions(input) {
-  const keys = ["view_vehicles","add_vehicle","edit_vehicle","delete_vehicle","progress","view_history","edit_history","delete_history","export_csv"];
+  const keys = ["view_vehicles","add_vehicle","edit_vehicle","delete_vehicle","progress","view_history","edit_history","delete_history","export_csv","view_insurance","add_insurance","edit_insurance","delete_insurance"];
   const out = {};
   for (const key of keys) out[key] = input && input[key] === true;
   return out;
@@ -223,6 +243,47 @@ app.post("/api/logout", requireAuth, (req, res, next) => {
     res.clearCookie("connect.sid");
     res.json({ ok: true });
   });
+});
+
+function cleanInsurance(body) {
+  const vehicle_name = String(body.vehicle_name || "").trim().slice(0, 100);
+  const insurance_type = String(body.insurance_type || "Bảo hiểm trách nhiệm dân sự").trim().slice(0, 120);
+  const insurer = String(body.insurer || "").trim().slice(0, 160);
+  const policy_number = String(body.policy_number || "").trim().slice(0, 120);
+  const start_date = body.start_date, end_date = body.end_date;
+  const premium = Number(body.premium || 0);
+  const notes = String(body.notes || "").trim().slice(0, 1000);
+  if (!vehicle_name) throw new Error("Vui lòng nhập biển số hoặc tên xe.");
+  if (!insurance_type) throw new Error("Vui lòng chọn loại bảo hiểm.");
+  if (!validDate(start_date) || !validDate(end_date)) throw new Error("Ngày bắt đầu/kết thúc bảo hiểm không hợp lệ.");
+  if (end_date < start_date) throw new Error("Ngày hết hạn không được trước ngày bắt đầu.");
+  if (!Number.isFinite(premium) || premium < 0) throw new Error("Phí bảo hiểm phải là số không âm.");
+  return { vehicle_name, insurance_type, insurer, policy_number, start_date, end_date, premium, notes };
+}
+app.get("/api/insurances", requirePermission("view_insurance"), async (req, res, next) => {
+  try { const { rows } = await pool.query("SELECT * FROM vehicle_insurances ORDER BY end_date ASC, vehicle_name ASC"); res.json({ insurances: rows }); }
+  catch (e) { next(e); }
+});
+app.post("/api/insurances", requirePermission("add_insurance"), async (req, res, next) => {
+  try {
+    const x = cleanInsurance(req.body);
+    const { rows } = await pool.query(`INSERT INTO vehicle_insurances(vehicle_name,insurance_type,insurer,policy_number,start_date,end_date,premium,notes,created_by)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`, [x.vehicle_name,x.insurance_type,x.insurer,x.policy_number,x.start_date,x.end_date,x.premium,x.notes,req.session.user.id]);
+    res.status(201).json({ insurance: rows[0] });
+  } catch (e) { if (e.message && /Vui lòng|không hợp lệ|không được|phải là số/.test(e.message)) return res.status(400).json({error:e.message}); next(e); }
+});
+app.put("/api/insurances/:id", requirePermission("edit_insurance"), async (req, res, next) => {
+  try {
+    const x = cleanInsurance(req.body);
+    const { rows } = await pool.query(`UPDATE vehicle_insurances SET vehicle_name=$1,insurance_type=$2,insurer=$3,policy_number=$4,start_date=$5,end_date=$6,premium=$7,notes=$8,updated_at=NOW()
+      WHERE id=$9 RETURNING *`, [x.vehicle_name,x.insurance_type,x.insurer,x.policy_number,x.start_date,x.end_date,x.premium,x.notes,req.params.id]);
+    if (!rows.length) return res.status(404).json({error:"Không tìm thấy hồ sơ bảo hiểm."});
+    res.json({ insurance: rows[0] });
+  } catch (e) { if (e.message && /Vui lòng|không hợp lệ|không được|phải là số/.test(e.message)) return res.status(400).json({error:e.message}); next(e); }
+});
+app.delete("/api/insurances/:id", requirePermission("delete_insurance"), async (req, res, next) => {
+  try { const r = await pool.query("DELETE FROM vehicle_insurances WHERE id=$1", [req.params.id]); if (!r.rowCount) return res.status(404).json({error:"Không tìm thấy hồ sơ bảo hiểm."}); res.json({ok:true}); }
+  catch (e) { next(e); }
 });
 
 app.get("/api/vehicles", requirePermission("view_vehicles"), async (req, res, next) => {
@@ -515,7 +576,7 @@ app.post('/api/admin/email-alerts/test', requireAdmin, async (req, res, next) =>
     await mailer.sendMail({
       from: process.env.SMTP_FROM || process.env.SMTP_USER,
       to: recipients.join(', '),
-      subject: '[3SCooltrans] Email kiểm tra cảnh báo giờ cấm',
+      subject: '[3SCooltrans] Email kiểm tra cảnh báo hồ sơ phương tiện',
       text: 'Đây là email kiểm tra từ website 3SCooltrans. Nếu bạn nhận được email này, cấu hình gửi mail đang hoạt động.'
     });
     res.json({ok:true});
@@ -584,14 +645,14 @@ async function sendExpiryAlerts() {
     async function sendStageAlert(vehicles, stageDays) {
       if (!vehicles.length) return;
       const lines = vehicles.map(v => `- ${v.vehicle_name}: hết hạn ${formatDate(v.end_date)} (${statusText(v.days_left)})`);
-      const subject = `[3SCooltrans] Cảnh báo giờ cấm: mốc ${stageDays} ngày (${vehicles.length} xe)`;
+      const subject = `[3SCooltrans] Cảnh báo hồ sơ phương tiện: mốc ${stageDays} ngày (${vehicles.length} xe)`;
       const htmlRows = vehicles.map(v => `<tr><td style="padding:8px;border:1px solid #ddd">${escapeHtml(v.vehicle_name)}</td><td style="padding:8px;border:1px solid #ddd">${formatDate(v.end_date)}</td><td style="padding:8px;border:1px solid #ddd">${escapeHtml(statusText(v.days_left))}</td></tr>`).join('');
       await mailer.sendMail({
         from: process.env.SMTP_FROM || process.env.SMTP_USER,
         to: recipients.join(', '),
         subject,
-        text: `Cảnh báo mốc ${stageDays} ngày trước ngày hết hạn giờ cấm.\n\n${lines.join('\n')}\n\nVui lòng đăng nhập website 3SCooltrans để kiểm tra và gia hạn.`,
-        html: `<div style="font-family:Arial,sans-serif"><h2>Cảnh báo giờ cấm xe – mốc ${stageDays} ngày</h2><p>Danh sách xe cần kiểm tra:</p><table style="border-collapse:collapse"><thead><tr><th style="padding:8px;border:1px solid #ddd">Xe</th><th style="padding:8px;border:1px solid #ddd">Ngày hết hạn</th><th style="padding:8px;border:1px solid #ddd">Tình trạng</th></tr></thead><tbody>${htmlRows}</tbody></table><p>Vui lòng đăng nhập website 3SCooltrans để kiểm tra và gia hạn.</p></div>`
+        text: `Cảnh báo mốc ${stageDays} ngày trước ngày hết hạn hồ sơ phương tiện.\n\n${lines.join('\n')}\n\nVui lòng đăng nhập website 3SCooltrans để kiểm tra và cập nhật hồ sơ.`,
+        html: `<div style="font-family:Arial,sans-serif"><h2>Cảnh báo hồ sơ phương tiện – mốc ${stageDays} ngày</h2><p>Danh sách xe cần kiểm tra:</p><table style="border-collapse:collapse"><thead><tr><th style="padding:8px;border:1px solid #ddd">Xe</th><th style="padding:8px;border:1px solid #ddd">Ngày hết hạn</th><th style="padding:8px;border:1px solid #ddd">Tình trạng</th></tr></thead><tbody>${htmlRows}</tbody></table><p>Vui lòng đăng nhập website 3SCooltrans để kiểm tra và cập nhật hồ sơ.</p></div>`
       });
       const ids = vehicles.map(v => v.id);
       const column = stageDays === 20 ? 'alert_20_sent_at' : 'alert_10_sent_at';
