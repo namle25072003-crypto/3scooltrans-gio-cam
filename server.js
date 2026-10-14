@@ -84,6 +84,31 @@ async function initDb() {
     ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS accounting_paid_date DATE;
     ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS new_restriction_received_date DATE;
   `);
+  // Renewal history is stored separately so past renewals remain available when the current expiry changes.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vehicle_renewal_history (
+      id BIGSERIAL PRIMARY KEY,
+      vehicle_id BIGINT NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+      renewal_date DATE NOT NULL,
+      amount NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK (amount >= 0),
+      valid_from DATE NOT NULL,
+      valid_until DATE NOT NULL,
+      notes TEXT NOT NULL DEFAULT '',
+      progress_document_created_date DATE,
+      progress_sent_to_vendor_date DATE,
+      progress_accounting_paid_date DATE,
+      progress_new_restriction_received_date DATE,
+      created_by BIGINT REFERENCES app_users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CHECK (valid_until >= valid_from)
+    );
+    ALTER TABLE vehicle_renewal_history ADD COLUMN IF NOT EXISTS progress_document_created_date DATE;
+    ALTER TABLE vehicle_renewal_history ADD COLUMN IF NOT EXISTS progress_sent_to_vendor_date DATE;
+    ALTER TABLE vehicle_renewal_history ADD COLUMN IF NOT EXISTS progress_accounting_paid_date DATE;
+    ALTER TABLE vehicle_renewal_history ADD COLUMN IF NOT EXISTS progress_new_restriction_received_date DATE;
+    CREATE INDEX IF NOT EXISTS idx_vehicle_renewal_history_vehicle_date
+      ON vehicle_renewal_history(vehicle_id, renewal_date DESC, id DESC);
+  `);
   const { rows } = await pool.query("SELECT id FROM app_users WHERE username=$1", [process.env.BOOTSTRAP_ADMIN_USERNAME]);
   if (!rows.length) {
     const hash = await bcrypt.hash(process.env.BOOTSTRAP_ADMIN_PASSWORD, 12);
@@ -155,21 +180,6 @@ app.post("/api/logout", requireAuth, (req, res, next) => {
 
 app.get("/api/vehicles", requireAuth, async (req, res, next) => {
   try {
-    // Automatically restart a completed 4/4 workflow 20 days before the current permit expires.
-    // Only the four workflow dates are cleared; vehicle and permit dates remain unchanged.
-    await pool.query(
-      `UPDATE vehicles
-       SET document_created_date=NULL,
-           sent_to_vendor_date=NULL,
-           accounting_paid_date=NULL,
-           new_restriction_received_date=NULL,
-           updated_at=NOW()
-       WHERE end_date <= CURRENT_DATE + INTERVAL '20 days'
-         AND document_created_date IS NOT NULL
-         AND sent_to_vendor_date IS NOT NULL
-         AND accounting_paid_date IS NOT NULL
-         AND new_restriction_received_date IS NOT NULL`
-    );
     const { rows } = await pool.query(
       `SELECT id,vehicle_name,
         to_char(start_date,'YYYY-MM-DD') AS start_date,
@@ -203,7 +213,16 @@ app.put("/api/vehicles/:id", requireAuth, async (req, res, next) => {
   try {
     const v = cleanVehicle(req.body);
     const { rows } = await pool.query(
-      `UPDATE vehicles SET vehicle_name=$1,start_date=$2,end_date=$3,notes=$4,updated_at=NOW()
+      `UPDATE vehicles
+       SET vehicle_name=$1,
+           start_date=$2,
+           end_date=$3,
+           notes=$4,
+           document_created_date=CASE WHEN end_date IS DISTINCT FROM $3::date THEN NULL ELSE document_created_date END,
+           sent_to_vendor_date=CASE WHEN end_date IS DISTINCT FROM $3::date THEN NULL ELSE sent_to_vendor_date END,
+           accounting_paid_date=CASE WHEN end_date IS DISTINCT FROM $3::date THEN NULL ELSE accounting_paid_date END,
+           new_restriction_received_date=CASE WHEN end_date IS DISTINCT FROM $3::date THEN NULL ELSE new_restriction_received_date END,
+           updated_at=NOW()
        WHERE id=$5
        RETURNING id,vehicle_name,to_char(start_date,'YYYY-MM-DD') AS start_date,
        to_char(end_date,'YYYY-MM-DD') AS end_date,notes`,
@@ -235,6 +254,67 @@ app.put("/api/vehicles/:id/progress", requireAuth, async (req, res, next) => {
     if (!rows.length) return res.status(404).json({error:"Không tìm thấy xe."});
     res.json({vehicle:rows[0]});
   } catch (e) { if (e.message && !e.code) return res.status(400).json({error:e.message}); next(e); }
+});
+
+app.get("/api/vehicles/:id/renewal-history", requireAuth, async (req, res, next) => {
+  try {
+    const vehicle = await pool.query("SELECT id, vehicle_name FROM vehicles WHERE id=$1", [req.params.id]);
+    if (!vehicle.rowCount) return res.status(404).json({error:"Không tìm thấy xe."});
+    const { rows } = await pool.query(
+      `SELECT id, to_char(renewal_date,'YYYY-MM-DD') AS renewal_date,
+       amount::text AS amount, to_char(valid_from,'YYYY-MM-DD') AS valid_from,
+       to_char(valid_until,'YYYY-MM-DD') AS valid_until, notes,
+       to_char(progress_document_created_date,'YYYY-MM-DD') AS progress_document_created_date,
+       to_char(progress_sent_to_vendor_date,'YYYY-MM-DD') AS progress_sent_to_vendor_date,
+       to_char(progress_accounting_paid_date,'YYYY-MM-DD') AS progress_accounting_paid_date,
+       to_char(progress_new_restriction_received_date,'YYYY-MM-DD') AS progress_new_restriction_received_date
+       FROM vehicle_renewal_history WHERE vehicle_id=$1
+       ORDER BY renewal_date DESC, id DESC`, [req.params.id]
+    );
+    res.json({vehicle:vehicle.rows[0], history:rows, renewal_count:rows.length});
+  } catch (e) { next(e); }
+});
+
+app.post("/api/vehicles/:id/renewal-history", requireAuth, async (req, res, next) => {
+  try {
+    const vehicleId = req.params.id;
+    const vehicle = await pool.query(
+      `SELECT id, document_created_date, sent_to_vendor_date, accounting_paid_date, new_restriction_received_date
+       FROM vehicles WHERE id=$1`, [vehicleId]
+    );
+    if (!vehicle.rowCount) return res.status(404).json({error:"Không tìm thấy xe."});
+    const renewal_date = req.body.renewal_date;
+    const valid_from = req.body.valid_from;
+    const valid_until = req.body.valid_until;
+    const amountRaw = req.body.amount;
+    const amount = Number(amountRaw);
+    const notes = String(req.body.notes || "").trim().slice(0, 1000);
+    if (!validDate(renewal_date) || !validDate(valid_from) || !validDate(valid_until)) {
+      return res.status(400).json({error:"Vui lòng nhập đủ ngày gia hạn, ngày bắt đầu và ngày hết hạn."});
+    }
+    if (valid_until < valid_from) return res.status(400).json({error:"Thời hạn đến ngày không được trước ngày bắt đầu."});
+    if (amountRaw === undefined || amountRaw === null || amountRaw === "" || !Number.isFinite(amount) || amount < 0) {
+      return res.status(400).json({error:"Số tiền không hợp lệ."});
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO vehicle_renewal_history(
+         vehicle_id,renewal_date,amount,valid_from,valid_until,notes,created_by,
+         progress_document_created_date,progress_sent_to_vendor_date,
+         progress_accounting_paid_date,progress_new_restriction_received_date
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING id, to_char(renewal_date,'YYYY-MM-DD') AS renewal_date,
+       amount::text AS amount, to_char(valid_from,'YYYY-MM-DD') AS valid_from,
+       to_char(valid_until,'YYYY-MM-DD') AS valid_until, notes,
+       to_char(progress_document_created_date,'YYYY-MM-DD') AS progress_document_created_date,
+       to_char(progress_sent_to_vendor_date,'YYYY-MM-DD') AS progress_sent_to_vendor_date,
+       to_char(progress_accounting_paid_date,'YYYY-MM-DD') AS progress_accounting_paid_date,
+       to_char(progress_new_restriction_received_date,'YYYY-MM-DD') AS progress_new_restriction_received_date`,
+      [vehicleId, renewal_date, amount, valid_from, valid_until, notes, req.session.user.id,
+       vehicle.rows[0].document_created_date, vehicle.rows[0].sent_to_vendor_date,
+       vehicle.rows[0].accounting_paid_date, vehicle.rows[0].new_restriction_received_date]
+    );
+    res.status(201).json({record:rows[0]});
+  } catch (e) { next(e); }
 });
 
 app.delete("/api/vehicles/:id", requireAuth, async (req, res, next) => {
