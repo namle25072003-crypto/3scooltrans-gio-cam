@@ -546,31 +546,42 @@ function createMailer() {
     port,
     secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    connectionTimeout: 30000,
-    greetingTimeout: 30000,
-    socketTimeout: 60000,
-    dnsTimeout: 15000,
-    pool: true,
-    maxConnections: 2,
-    maxMessages: 20
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
+    socketTimeout: 45000,
+    dnsTimeout: 10000,
+    // Do not reuse SMTP sockets: Render may resume a sleeping instance with stale connections.
+    pool: false,
+    requireTLS: port === 587,
+    tls: { servername: process.env.SMTP_HOST }
   });
 }
 
-// Retry transient SMTP connection failures (for example after Render wakes up).
-// Do not retry permanent authentication/address errors.
-async function sendMailWithRetry(mailer, message, maxAttempts = 3) {
+// Retry transient SMTP failures using a NEW transport for each attempt.
+// Reusing a pooled/stale socket after Render resumes can repeatedly time out.
+async function sendMailWithRetry(message, maxAttempts = 3) {
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let mailer;
     try {
-      return await mailer.sendMail(message);
+      mailer = createMailer();
+      if (!mailer) throw new Error('SMTP is not configured');
+      // Verify the connection before sending, so connection errors are logged clearly.
+      await mailer.verify();
+      const result = await mailer.sendMail(message);
+      console.log(`SMTP send succeeded on attempt ${attempt}/${maxAttempts}`);
+      return result;
     } catch (err) {
       lastError = err;
       const code = String(err.code || '');
       const responseCode = Number(err.responseCode || 0);
-      const transient = ['ETIMEDOUT', 'ECONNECTION', 'ECONNRESET', 'EPIPE', 'ESOCKET', 'EDNS'].includes(code) || responseCode >= 400 && responseCode < 500;
-      console.error(`SMTP send attempt ${attempt}/${maxAttempts} failed: code=${code || 'unknown'} responseCode=${responseCode || 'none'} message=${err.message}`);
+      const transient = ['ETIMEDOUT', 'ECONNECTION', 'ECONNRESET', 'EPIPE', 'ESOCKET', 'EDNS', 'ECONNREFUSED'].includes(code) || (responseCode >= 400 && responseCode < 500);
+      console.error(`SMTP send attempt ${attempt}/${maxAttempts} failed: code=${code || 'unknown'} responseCode=${responseCode || 'none'} command=${err.command || 'unknown'} message=${err.message}`);
       if (!transient || attempt === maxAttempts) throw err;
+      // Exponential backoff: 5s, then 15s before the final attempt.
       await new Promise(resolve => setTimeout(resolve, attempt * 5000));
+    } finally {
+      if (mailer) { try { mailer.close(); } catch (_) {} }
     }
   }
   throw lastError;
@@ -598,9 +609,8 @@ app.post('/api/admin/email-alerts/test', requireAdmin, async (req, res, next) =>
   try {
     const recipients = cleanEmailList(req.body.recipients || []);
     if (!recipients.length) return res.status(400).json({error:'Nhập ít nhất một địa chỉ email để gửi thử.'});
-    const mailer = createMailer();
-    if (!mailer) return res.status(503).json({error:'Chưa cấu hình SMTP trên Render. Hãy thêm SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS và SMTP_FROM.'});
-    await sendMailWithRetry(mailer, {
+    if (!createMailer()) return res.status(503).json({error:'Chưa cấu hình SMTP trên Render. Hãy thêm SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS và SMTP_FROM.'});
+    await sendMailWithRetry({
       from: process.env.SMTP_FROM || process.env.SMTP_USER,
       to: recipients.join(', '),
       subject: '[3SCooltrans] Email kiểm tra cảnh báo hồ sơ phương tiện',
@@ -610,8 +620,7 @@ app.post('/api/admin/email-alerts/test', requireAdmin, async (req, res, next) =>
   } catch (e) { if (e.message.includes('email') || e.message.includes('50 địa')) return res.status(400).json({error:e.message}); next(e); }
 });
 async function sendExpiryAlerts() {
-  const mailer = createMailer();
-  if (!mailer) {
+  if (!createMailer()) {
     console.warn('Email alert skipped: SMTP environment variables are not configured.');
     return;
   }
@@ -674,7 +683,7 @@ async function sendExpiryAlerts() {
       const lines = vehicles.map(v => `- ${v.vehicle_name}: hết hạn ${formatDate(v.end_date)} (${statusText(v.days_left)})`);
       const subject = `[3SCooltrans] Cảnh báo hồ sơ phương tiện: mốc ${stageDays} ngày (${vehicles.length} xe)`;
       const htmlRows = vehicles.map(v => `<tr><td style="padding:8px;border:1px solid #ddd">${escapeHtml(v.vehicle_name)}</td><td style="padding:8px;border:1px solid #ddd">${formatDate(v.end_date)}</td><td style="padding:8px;border:1px solid #ddd">${escapeHtml(statusText(v.days_left))}</td></tr>`).join('');
-      await sendMailWithRetry(mailer, {
+      await sendMailWithRetry({
         from: process.env.SMTP_FROM || process.env.SMTP_USER,
         to: recipients.join(', '),
         subject,
