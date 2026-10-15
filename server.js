@@ -545,8 +545,35 @@ function createMailer() {
     host: process.env.SMTP_HOST,
     port,
     secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    connectionTimeout: 30000,
+    greetingTimeout: 30000,
+    socketTimeout: 60000,
+    dnsTimeout: 15000,
+    pool: true,
+    maxConnections: 2,
+    maxMessages: 20
   });
+}
+
+// Retry transient SMTP connection failures (for example after Render wakes up).
+// Do not retry permanent authentication/address errors.
+async function sendMailWithRetry(mailer, message, maxAttempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await mailer.sendMail(message);
+    } catch (err) {
+      lastError = err;
+      const code = String(err.code || '');
+      const responseCode = Number(err.responseCode || 0);
+      const transient = ['ETIMEDOUT', 'ECONNECTION', 'ECONNRESET', 'EPIPE', 'ESOCKET', 'EDNS'].includes(code) || responseCode >= 400 && responseCode < 500;
+      console.error(`SMTP send attempt ${attempt}/${maxAttempts} failed: code=${code || 'unknown'} responseCode=${responseCode || 'none'} message=${err.message}`);
+      if (!transient || attempt === maxAttempts) throw err;
+      await new Promise(resolve => setTimeout(resolve, attempt * 5000));
+    }
+  }
+  throw lastError;
 }
 function emailSettingsStatus() {
   return { smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS), from: process.env.SMTP_FROM || process.env.SMTP_USER || '' };
@@ -573,7 +600,7 @@ app.post('/api/admin/email-alerts/test', requireAdmin, async (req, res, next) =>
     if (!recipients.length) return res.status(400).json({error:'Nhập ít nhất một địa chỉ email để gửi thử.'});
     const mailer = createMailer();
     if (!mailer) return res.status(503).json({error:'Chưa cấu hình SMTP trên Render. Hãy thêm SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS và SMTP_FROM.'});
-    await mailer.sendMail({
+    await sendMailWithRetry(mailer, {
       from: process.env.SMTP_FROM || process.env.SMTP_USER,
       to: recipients.join(', '),
       subject: '[3SCooltrans] Email kiểm tra cảnh báo hồ sơ phương tiện',
@@ -647,7 +674,7 @@ async function sendExpiryAlerts() {
       const lines = vehicles.map(v => `- ${v.vehicle_name}: hết hạn ${formatDate(v.end_date)} (${statusText(v.days_left)})`);
       const subject = `[3SCooltrans] Cảnh báo hồ sơ phương tiện: mốc ${stageDays} ngày (${vehicles.length} xe)`;
       const htmlRows = vehicles.map(v => `<tr><td style="padding:8px;border:1px solid #ddd">${escapeHtml(v.vehicle_name)}</td><td style="padding:8px;border:1px solid #ddd">${formatDate(v.end_date)}</td><td style="padding:8px;border:1px solid #ddd">${escapeHtml(statusText(v.days_left))}</td></tr>`).join('');
-      await mailer.sendMail({
+      await sendMailWithRetry(mailer, {
         from: process.env.SMTP_FROM || process.env.SMTP_USER,
         to: recipients.join(', '),
         subject,
@@ -669,6 +696,10 @@ async function sendExpiryAlerts() {
 }
 // Run once daily at 08:00 Vietnam time. SMTP settings are configured in Render environment variables.
 cron.schedule('0 8 * * *', sendExpiryAlerts, { timezone: 'Asia/Ho_Chi_Minh' });
+// Run a catch-up check shortly after startup; failed SMTP sends are retried by sendMailWithRetry.
+setTimeout(() => {
+  sendExpiryAlerts().catch(err => console.error('Startup expiry alert check failed:', err.message));
+}, 15000);
 
 // User management is restricted to admins. Passwords are never returned by the API.
 app.get("/api/users", requireAdmin, async (req, res, next) => {
@@ -733,12 +764,7 @@ app.use((err, req, res, next) => {
 });
 
 initDb().then(() => {
-  app.listen(PORT, () => {
-    console.log(`3SCooltrans app listening on port ${PORT}`);
-    // Run once after startup as well as daily at 08:00 Vietnam time.
-    // This catches alerts if the service restarted after the scheduled time.
-    sendExpiryAlerts().catch(err => console.error("Startup expiry alert check failed:", err.message));
-  });
+  app.listen(PORT, () => console.log(`3SCooltrans app listening on port ${PORT}`));
 }).catch(err => {
   console.error("Database initialization failed:", err);
   process.exit(1);
