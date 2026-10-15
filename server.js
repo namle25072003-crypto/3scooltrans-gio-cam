@@ -733,7 +733,12 @@ app.use((err, req, res, next) => {
 });
 
 initDb().then(() => {
-  app.listen(PORT, () => console.log(`3SCooltrans app listening on port ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`3SCooltrans app listening on port ${PORT}`);
+    // Run once after startup as well as daily at 08:00 Vietnam time.
+    // This catches alerts if the service restarted after the scheduled time.
+    sendExpiryAlerts().catch(err => console.error("Startup expiry alert check failed:", err.message));
+  });
 }).catch(err => {
   console.error("Database initialization failed:", err);
   process.exit(1);
